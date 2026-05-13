@@ -1,5 +1,6 @@
 from importlib.util import find_spec
-
+from sglangnorm import _layer_norm_fwd_1pass_kernel
+import triton
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,7 +32,53 @@ class LayerNorm(nn.LayerNorm, CustomOp):
         return self._forward_method(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+        weight = self.weight
+        bias = self.bias
+        eps = self.eps
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])   # (M, N)
+        M, N = x_2d.shape
+    
+        # outputs
+        y    = torch.empty_like(x_2d)
+        mean = torch.empty(M, dtype=torch.float32, device=x.device)
+        rstd = torch.empty(M, dtype=torch.float32, device=x.device)
+    
+        BLOCK_N = triton.next_power_of_2(N)
+        # Triton caps at 2^17 = 131072 elements per block; assert just in case
+        assert BLOCK_N <= 131072, f"hidden_dim {N} too large for single-block kernel"
+    
+        grid = (M,)
+        _layer_norm_fwd_1pass_kernel[grid](
+            # data pointers
+            x_2d, y, weight, bias,
+            # unused optional pointers — pass x_2d as a harmless dummy
+            x_2d, x_2d, weight, bias, y, x_2d,
+            x_2d, x_2d, x_2d, x_2d,
+            mean, rstd,
+            # strides
+            x_2d.stride(0), y.stride(0),
+            x_2d.stride(0), x_2d.stride(0),
+            x_2d.stride(0), y.stride(0),
+            # scalars
+            M, N, eps,
+            0.0,    # dropout_p
+            False,  # zero_centered_weight
+            # constexprs — only the ones we actually need are True
+            IS_RMS_NORM        = False,
+            BLOCK_N            = BLOCK_N,
+            HAS_RESIDUAL       = False,
+            STORE_RESIDUAL_OUT = False,
+            HAS_WEIGHT         = True,
+            HAS_BIAS           = True,
+            HAS_DROPOUT        = False,
+            STORE_DROPOUT_MASK = False,
+            HAS_ROWSCALE       = False,
+            HAS_X1             = False,
+            HAS_W1             = False,
+            HAS_B1             = False,
+        )
+        return y.reshape(orig_shape)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
