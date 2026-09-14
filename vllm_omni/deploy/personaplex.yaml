@@ -37,7 +37,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 10
-    gpu_memory_utilization: 0.4
+    gpu_memory_utilization: 0.5
     trust_remote_code: true
     skip_tokenizer_init: true
     # Prompt IDs are placeholders; voice/persona/audio semantics live in
