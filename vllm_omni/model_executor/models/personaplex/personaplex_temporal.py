@@ -43,22 +43,32 @@ import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import _rms_norm_f32
 
+# headdim -> (offset, T, rotr, roti)
+_rope_cache: dict[int, tuple[int, int, torch.Tensor, torch.Tensor]] = {}
 
-def _apply_rope(q: torch.Tensor, k: torch.Tensor, offset: torch.Tensor, max_period: float = 10_000.0):
+def _apply_rope(q: torch.Tensor, k: torch.Tensor, offset: int, max_period: float = 10_000.0):
     """Interleaved RoPE at absolute ``offset``, fp32 rotation (moshi ``apply_rope``)."""
     B, H, T, D = q.shape
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float() + torch.arange(T, device=q.device, dtype=torch.float32)
-    ts = ts.view(1, -1, 1)
+    cache = _rope_cache.get(D)
+    if cache and cache[0]==offset and cache[1]==T:
+        rotr = cache[2]
+        roti = cache[3]
+    else:
+        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
+        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+        ts = offset + torch.arange(T, device=q.device, dtype=torch.float32)
+        ts = ts.view(1, -1, 1)
+        rotr = torch.cos(freqs * ts)
+        roti = torch.sin(freqs * ts)
+        # cache it after first calculate time
+        _rope_cache[D] = (offset, T, rotr, roti)
 
     dims = q.shape[:-1]
     q = q.view(*dims, D // 2, 2)
     k = k.view(*dims, D // 2, 2)
     qr, qi = q[..., 0].float(), q[..., 1].float()
     kr, ki = k[..., 0].float(), k[..., 1].float()
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
+        
     qor = qr * rotr - qi * roti
     qoi = qr * roti + qi * rotr
     kor = kr * rotr - ki * roti
@@ -137,7 +147,7 @@ class _TemporalLayer(nn.Module):
         self.norm1_alpha = nn.Parameter(torch.ones(1, 1, dim))
         self.norm2_alpha = nn.Parameter(torch.ones(1, 1, dim))
 
-    def forward(self, x: torch.Tensor, kv: _RingKV, offset: torch.Tensor, context: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv: _RingKV, offset: int, context: int) -> torch.Tensor:
         B, T, _ = x.shape
         h = _rms_norm_f32(x, self.norm1_alpha, 1e-8)
         qkv = F.linear(h, self.in_proj_weight)
@@ -225,7 +235,7 @@ class PersonaPlexTemporalStreaming(nn.Module):
         assert self._kv is not None, "call streaming_init first"
         x = frame_embedding
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context)
+            x = layer(x, kv, int(self._offset.item()), self.context)
         self._offset.add_(x.shape[1])
         out = _rms_norm_f32(x, self.out_norm_alpha, 1e-8)
         text_logits = F.linear(out, self.text_linear)

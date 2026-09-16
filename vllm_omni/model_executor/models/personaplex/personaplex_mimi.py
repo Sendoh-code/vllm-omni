@@ -34,6 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
+    _rope_cache,
     _apply_rope,
     _RingKV,
 )
@@ -183,7 +184,7 @@ class _MimiTransformerLayer(nn.Module):
         self.scale1 = nn.Parameter(torch.empty(dim))
         self.scale2 = nn.Parameter(torch.empty(dim))
 
-    def forward(self, x: torch.Tensor, kv: _RingKV, offset: torch.Tensor, context: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv: _RingKV, offset: int, context: int) -> torch.Tensor:
         B, T, _ = x.shape
         h = self.norm1(x)
         qkv = F.linear(h, self.in_proj_weight)
@@ -232,7 +233,7 @@ class _MimiStreamingTransformer(nn.Module):
     def step(self, x: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context)
+            x = layer(x, kv, int(self._offset.item()), self.context)
         self._offset.add_(x.shape[1])
         return x
 
