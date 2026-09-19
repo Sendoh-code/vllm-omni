@@ -34,8 +34,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
-    _rope_cache,
+    _rope_tables,
     _apply_rope,
+    _ringkv_positions,
     _RingKV,
 )
 
@@ -184,16 +185,26 @@ class _MimiTransformerLayer(nn.Module):
         self.scale1 = nn.Parameter(torch.empty(dim))
         self.scale2 = nn.Parameter(torch.empty(dim))
 
-    def forward(self, x: torch.Tensor, kv: _RingKV, offset: int, context: int) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv: _RingKV,
+        offset: torch.Tensor,
+        context: int,
+        rotr,
+        roti,
+        indexes,
+        positions_pre_mask,
+    ) -> torch.Tensor:
         B, T, _ = x.shape
         h = self.norm1(x)
         qkv = F.linear(h, self.in_proj_weight)
         qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = _apply_rope(q, k, offset)
-        keys, values, pos_k = kv.complete(k, v)
+        q, k = _apply_rope(q, k, rotr, roti)
+        keys, values, pos_k = kv.complete(k, v, indexes, positions_pre_mask)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])
-        pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
+        pos_q = offset.float() + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
         attn_bias = (pos_k >= 0) & (delta >= 0) & (delta < context)
         attn = F.scaled_dot_product_attention(q, keys, values, attn_bias.unsqueeze(1), dropout_p=0.0)
@@ -232,8 +243,10 @@ class _MimiStreamingTransformer(nn.Module):
 
     def step(self, x: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
+        rotr, roti = _rope_tables(self.layers[0].head_dim, x, self._offset)
+        indexes, positions_pre_mask = _ringkv_positions(self._offset, x.shape[1], self.context, x.device)
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, int(self._offset.item()), self.context)
+            x = layer(x, kv, self._offset, self.context, rotr, roti, indexes, positions_pre_mask)
         self._offset.add_(x.shape[1])
         return x
 
